@@ -33,8 +33,8 @@
 //! ```
 
 #![warn(missing_docs)]
-use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bdk_wallet::chain::BlockId;
 use bdk_wallet::chain::CheckPoint;
@@ -50,14 +50,16 @@ pub extern crate bip157;
 use bip157::chain::BlockHeaderChanges;
 use bip157::error::FetchBlockError;
 use bip157::tokio;
+use bip157::Event;
 use bip157::IndexedBlock;
 use bip157::ScriptBuf;
+#[cfg(test)]
+use bip157::SyncUpdate;
 #[doc(inline)]
 pub use bip157::{
     BlockHash, ClientError, FeeRate, HashCheckpoint, Info, Node, RejectPayload, RejectReason,
     Requester, TrustedPeer, Warning, Wtxid,
 };
-use bip157::{Event, SyncUpdate};
 
 #[doc(inline)]
 pub use bip157::Receiver;
@@ -255,7 +257,9 @@ pub struct UpdateSubscriber<W: Wallets> {
     // channel receiver
     receiver: UnboundedReceiver<Event>,
     // queued blocks to fetch
-    queued_blocks: Vec<BlockHash>,
+    queued_blocks: BTreeSet<(u32, BlockHash)>,
+    // Retain a consumed sync boundary when a block fetch is cancelled.
+    filters_synced: bool,
     // queued scripts to check filters
     spk_cache: HashSet<ScriptBuf>,
     // processes events for the wallet.
@@ -281,7 +285,8 @@ impl<W: Wallets> UpdateSubscriber<W> {
             receiver,
             single_update_builder: Some(update_builder),
             multiple_updates_builder: None,
-            queued_blocks: Vec::new(),
+            queued_blocks: BTreeSet::new(),
+            filters_synced: false,
             spk_cache,
             _marker: core::marker::PhantomData,
         }
@@ -312,14 +317,15 @@ impl<W: Wallets> UpdateSubscriber<W> {
             receiver,
             single_update_builder: None,
             multiple_updates_builder: Some(update_map),
-            queued_blocks: Vec::new(),
+            queued_blocks: BTreeSet::new(),
+            filters_synced: false,
             spk_cache,
             _marker: core::marker::PhantomData,
         }
     }
 
-    fn queue_block(&mut self, _height: u32, hash: BlockHash) {
-        self.queued_blocks.push(hash);
+    fn queue_block(&mut self, height: u32, hash: BlockHash) {
+        self.queued_blocks.insert((height, hash));
     }
 
     async fn sync(&mut self) -> Result<(), UpdateError> {
@@ -332,7 +338,50 @@ impl<W: Wallets> UpdateSubscriber<W> {
         F: FnMut(BlockHash) -> Fut,
         Fut: core::future::Future<Output = Result<IndexedBlock, FetchBlockError>>,
     {
-        while let Some(message) = self.receiver.recv().await {
+        loop {
+            if self.filters_synced {
+                // Apply funding outputs before later spends, even if filters arrived out of
+                // order. A queued block is retained across cancellation until it is applied.
+                while let Some(&(_, hash)) = self.queued_blocks.first() {
+                    let block = match fetch(hash).await {
+                        Ok(block) => block,
+                        // Preserve #180: orphaned matches have replacement filters of their own.
+                        Err(FetchBlockError::UnknownHash) => {
+                            self.queued_blocks.pop_first();
+                            continue;
+                        }
+                        Err(FetchBlockError::RecvError) if self.requester.is_running() => {
+                            self.queued_blocks.pop_first();
+                            continue;
+                        }
+                        Err(_) => return Err(UpdateError::NodeStopped),
+                    };
+                    if let Some(single) = self.single_update_builder.as_mut() {
+                        single.apply_block_event(&block);
+                    }
+                    if let Some(multiple) = self.multiple_updates_builder.as_mut() {
+                        for builder in multiple.values_mut() {
+                            builder.apply_block_event(&block);
+                        }
+                    }
+                    self.queued_blocks.pop_first();
+                }
+                if let Some(single) = self.single_update_builder.as_mut() {
+                    self.spk_cache
+                        .extend(single.peek_script_to_keychain_lookahead());
+                }
+                if let Some(multiple) = self.multiple_updates_builder.as_mut() {
+                    for builder in multiple.values() {
+                        self.spk_cache
+                            .extend(builder.peek_script_to_keychain_lookahead());
+                    }
+                }
+                self.filters_synced = false;
+                return Ok(());
+            }
+            let Some(message) = self.receiver.recv().await else {
+                return Err(UpdateError::NodeStopped);
+            };
             match message {
                 Event::IndexedFilter(filter) => {
                     let block_hash = filter.block_hash();
@@ -350,52 +399,9 @@ impl<W: Wallets> UpdateSubscriber<W> {
                         }
                     }
                 }
-                Event::FiltersSynced(SyncUpdate {
-                    tip: _,
-                    recent_history: _,
-                }) => {
-                    while let Some(&hash) = self.queued_blocks.last() {
-                        let block = match fetch(hash).await {
-                            Ok(block) => block,
-                            // The block was reorganized out of the best chain after its filter
-                            // matched, either before the node received the request or while it
-                            // was queued. Skip it: the blocks that replace it have their own
-                            // filters.
-                            Err(FetchBlockError::UnknownHash) => {
-                                self.queued_blocks.pop();
-                                continue;
-                            }
-                            Err(FetchBlockError::RecvError) if self.requester.is_running() => {
-                                self.queued_blocks.pop();
-                                continue;
-                            }
-                            Err(_) => return Err(UpdateError::NodeStopped),
-                        };
-                        if let Some(single) = self.single_update_builder.as_mut() {
-                            single.apply_block_event(&block);
-                        }
-                        if let Some(multiple) = self.multiple_updates_builder.as_mut() {
-                            for builder in multiple.values_mut() {
-                                builder.apply_block_event(&block);
-                            }
-                        }
-                        self.queued_blocks.pop();
-                    }
-                    if let Some(single) = self.single_update_builder.as_mut() {
-                        self.spk_cache
-                            .extend(single.peek_script_to_keychain_lookahead());
-                    }
-                    if let Some(multiple) = self.multiple_updates_builder.as_mut() {
-                        for builder in multiple.values() {
-                            self.spk_cache
-                                .extend(builder.peek_script_to_keychain_lookahead());
-                        }
-                    }
-                    return Ok(());
-                }
+                Event::FiltersSynced(_) => self.filters_synced = true,
             }
         }
-        Err(UpdateError::NodeStopped)
     }
 }
 
