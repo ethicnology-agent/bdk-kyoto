@@ -286,3 +286,257 @@ async fn queued_orphan_is_skipped_before_canonical_replacement() {
         .iter()
         .any(|tx| tx.compute_txid() == replacement_id));
 }
+
+fn multi_wallets() -> [bdk_wallet::Wallet; 2] {
+    [
+        bdk_wallet::Wallet::create(EXTERNAL, INTERNAL)
+            .network(Network::Bitcoin)
+            .lookahead(1000)
+            .create_wallet_no_persist()
+            .unwrap(),
+        bdk_wallet::Wallet::create(
+            EXTERNAL.replace("/0/*", "/2/*"),
+            INTERNAL.replace("/1/*", "/3/*"),
+        )
+        .network(Network::Bitcoin)
+        .lookahead(1000)
+        .create_wallet_no_persist()
+        .unwrap(),
+    ]
+}
+
+fn multi_subscriber(
+    wallets: &[bdk_wallet::Wallet],
+) -> (
+    UpdateSubscriber<wallets::Multiple>,
+    UnboundedSender<Event>,
+    Node,
+) {
+    use bdk_wallet::chain::DescriptorExt;
+    let (node, client) = builder::Builder::new(Network::Bitcoin).build();
+    let (sender, receiver) = unbounded_channel();
+    let subscriber = UpdateSubscriber::<wallets::Multiple>::new_multiple(
+        client.requester,
+        receiver,
+        wallets.iter().map(|wallet| {
+            (
+                wallet
+                    .public_descriptor(KeychainKind::External)
+                    .descriptor_id(),
+                SyncPolicy::SyncFromLast,
+                wallet.latest_checkpoint(),
+                IndexedTxGraph::new(wallet.spk_index().clone()),
+            )
+        }),
+    );
+    (subscriber, sender, node)
+}
+
+fn send_boundary(sender: &UnboundedSender<Event>, block: &IndexedBlock) {
+    sender
+        .send(Event::ChainUpdate(BlockHeaderChanges::Connected(
+            bip157::chain::IndexedHeader {
+                height: block.height,
+                header: block.block.header,
+            },
+        )))
+        .unwrap();
+    sender
+        .send(Event::FiltersSynced(SyncUpdate {
+            tip: (block.height, block.block.block_hash()).into(),
+            recent_history: Default::default(),
+        }))
+        .unwrap();
+}
+
+fn finish_multiple(
+    subscriber: &mut UpdateSubscriber<wallets::Multiple>,
+) -> BTreeMap<DescriptorId, Update> {
+    subscriber
+        .multiple_updates_builder
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .map(|(id, builder)| (*id, builder.finish()))
+        .collect()
+}
+
+#[tokio::test]
+async fn multi_updates_repeat_only_after_the_next_sync_boundary() {
+    use bdk_wallet::chain::DescriptorExt;
+    let wallets = multi_wallets();
+    let expected_ids = wallets
+        .iter()
+        .map(|wallet| {
+            wallet
+                .public_descriptor(KeychainKind::External)
+                .descriptor_id()
+        })
+        .collect::<BTreeSet<_>>();
+    let (mut subscriber, sender, _node) = multi_subscriber(&wallets);
+    for height in [1, 2] {
+        // Cancellation while awaiting the next boundary must not replay the previous update.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), subscriber.updates())
+                .await
+                .is_err()
+        );
+        let next = block(payment(ScriptBuf::new(), OutPoint::null()), height);
+        send_boundary(&sender, &next);
+        let updates = subscriber
+            .updates()
+            .await
+            .unwrap()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            updates.keys().copied().collect::<BTreeSet<_>>(),
+            expected_ids
+        );
+        for update in updates.values() {
+            assert_eq!(update.chain.as_ref().unwrap().height(), height);
+        }
+    }
+    drop(sender);
+    assert!(matches!(
+        subscriber.updates().await,
+        Err(UpdateError::NodeStopped)
+    ));
+}
+
+#[tokio::test]
+async fn multi_wallet_routing_keeps_script_999_and_later_spends() {
+    use bdk_wallet::chain::DescriptorExt;
+    let wallets = multi_wallets();
+    let ids = wallets
+        .iter()
+        .map(|wallet| {
+            wallet
+                .public_descriptor(KeychainKind::External)
+                .descriptor_id()
+        })
+        .collect::<Vec<_>>();
+    let (mut subscriber, sender, _node) = multi_subscriber(&wallets);
+    let mut funding = vec![];
+    for (wallet, keychain) in wallets
+        .iter()
+        .zip([KeychainKind::External, KeychainKind::Internal])
+    {
+        let script = wallet.peek_address(keychain, 999).address.script_pubkey();
+        assert!(subscriber.spk_cache.contains(&script));
+        funding.push(payment(script, OutPoint::null()));
+    }
+    let blocks = funding
+        .iter()
+        .enumerate()
+        .map(|(index, tx)| block(tx.clone(), index as u32 + 1))
+        .collect::<Vec<_>>();
+    for next in &blocks {
+        subscriber.queue_block(next.height, next.block.block_hash());
+    }
+    send_boundary(&sender, blocks.last().unwrap());
+    subscriber
+        .sync_with_fetch(|hash| {
+            std::future::ready(Ok(blocks
+                .iter()
+                .find(|block| block.block.block_hash() == hash)
+                .unwrap()
+                .clone()))
+        })
+        .await
+        .unwrap();
+    let updates = finish_multiple(&mut subscriber);
+    for (index, id) in ids.iter().enumerate() {
+        let txids = updates[id]
+            .tx_update
+            .txs
+            .iter()
+            .map(|tx| tx.compute_txid())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(txids, BTreeSet::from([funding[index].compute_txid()]));
+    }
+    // The index must survive finish() so the next loop can recognize spends of prior outputs.
+    let spend = payment(
+        ScriptBuf::new(),
+        OutPoint {
+            txid: funding[0].compute_txid(),
+            vout: 0,
+        },
+    );
+    let next = block(spend.clone(), 3);
+    subscriber.queue_block(next.height, next.block.block_hash());
+    send_boundary(&sender, &next);
+    subscriber
+        .sync_with_fetch(|_| std::future::ready(Ok(next.clone())))
+        .await
+        .unwrap();
+    let updates = finish_multiple(&mut subscriber);
+    assert_eq!(updates[&ids[0]].tx_update.txs.len(), 1);
+    assert_eq!(
+        updates[&ids[0]].tx_update.txs[0].compute_txid(),
+        spend.compute_txid()
+    );
+    assert!(updates[&ids[1]].tx_update.txs.is_empty());
+}
+
+#[tokio::test]
+async fn multi_cancelled_fetch_retains_each_wallet_update() {
+    use bdk_wallet::chain::DescriptorExt;
+    let wallets = multi_wallets();
+    let (mut subscriber, sender, _node) = multi_subscriber(&wallets);
+    let blocks = wallets
+        .iter()
+        .enumerate()
+        .map(|(index, wallet)| {
+            block(
+                payment(
+                    wallet
+                        .peek_address(KeychainKind::External, 0)
+                        .address
+                        .script_pubkey(),
+                    OutPoint::null(),
+                ),
+                index as u32 + 1,
+            )
+        })
+        .collect::<Vec<_>>();
+    for block in &blocks {
+        subscriber.queue_block(block.height, block.block.block_hash());
+    }
+    send_boundary(&sender, blocks.last().unwrap());
+    let mut fetched = 0;
+    assert!(tokio::time::timeout(
+        Duration::from_millis(10),
+        subscriber.sync_with_fetch(|_| {
+            fetched += 1;
+            let first = blocks[0].clone();
+            let wait = fetched > 1;
+            async move {
+                if wait {
+                    std::future::pending::<()>().await;
+                }
+                Ok(first)
+            }
+        })
+    )
+    .await
+    .is_err());
+    assert_eq!(fetched, 2);
+    assert_eq!(subscriber.queued_blocks.len(), 1);
+    assert!(subscriber.filters_synced);
+    // Resume without another FiltersSynced; preserve the first wallet's already applied block.
+    subscriber
+        .sync_with_fetch(|_| std::future::ready(Ok(blocks[1].clone())))
+        .await
+        .unwrap();
+    let updates = finish_multiple(&mut subscriber);
+    for (wallet, block) in wallets.iter().zip(&blocks) {
+        let id = wallet
+            .public_descriptor(KeychainKind::External)
+            .descriptor_id();
+        assert_eq!(updates[&id].tx_update.txs.len(), 1);
+        assert_eq!(
+            updates[&id].tx_update.txs[0].compute_txid(),
+            block.block.txdata[0].compute_txid()
+        );
+    }
+}
