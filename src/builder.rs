@@ -39,6 +39,7 @@
 //! }
 //! ```
 
+use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use bdk_wallet::{
@@ -143,6 +144,18 @@ impl BuilderExt for Builder {
         if self.network().ne(&network) {
             return Err(BuilderError::NetworkMismatch);
         }
+        let mut descriptor_ids = BTreeSet::new();
+        for (wallet, _) in &wallets {
+            if wallet.network() != network {
+                return Err(BuilderError::NetworkMismatch);
+            }
+            let descriptor_id = wallet
+                .public_descriptor(KeychainKind::External)
+                .descriptor_id();
+            if !descriptor_ids.insert(descriptor_id) {
+                return Err(BuilderError::DuplicateDescriptor);
+            }
+        }
         let cp_min = wallets
             .iter()
             .map(|(wallet, _)| walk_back_max_reorg(wallet.latest_checkpoint()))
@@ -220,6 +233,8 @@ pub enum BuilderError {
     NetworkMismatch,
     /// The wallet iterator is empty.
     EmptyIterator,
+    /// More than one wallet has the same external descriptor identifier.
+    DuplicateDescriptor,
 }
 
 impl Display for BuilderError {
@@ -229,6 +244,9 @@ impl Display for BuilderError {
                 write!(f, "wallet network and node network do not match")
             }
             BuilderError::EmptyIterator => write!(f, "empty wallet iterator."),
+            BuilderError::DuplicateDescriptor => {
+                write!(f, "wallet external descriptors must be distinct")
+            }
         }
     }
 }
@@ -265,5 +283,54 @@ mod tests {
     fn contiguous_checkpoints_keep_seven_block_reorg_margin() {
         let heights = (0..=20).collect::<Vec<_>>();
         assert_eq!(walk_back_max_reorg(checkpoints(&heights)).height, 13);
+    }
+
+    fn public_wallet(network: Network) -> Wallet {
+        const EXTERNAL: &str = "wpkh([73c5da0a/84h/0h/0h]xpub6CatWdiZiodmUeTDp8LT5or8nmbKNcuyvz7WyksVFkKB4RHwCD3XyuvPEbvqAQY3rAPshWcMLoP2fMFMKHPJ4ZeZXYVUhLv1VMrjPC7PW6V/0/*)";
+        const INTERNAL: &str = "wpkh([73c5da0a/84h/0h/0h]xpub6CatWdiZiodmUeTDp8LT5or8nmbKNcuyvz7WyksVFkKB4RHwCD3XyuvPEbvqAQY3rAPshWcMLoP2fMFMKHPJ4ZeZXYVUhLv1VMrjPC7PW6V/1/*)";
+        Wallet::create(EXTERNAL, INTERNAL)
+            .network(network)
+            .create_wallet_no_persist()
+            .unwrap()
+    }
+
+    #[test]
+    fn multi_wallet_builder_rejects_later_network_mismatch() {
+        let first = public_wallet(Network::Bitcoin);
+        let second = Wallet::create(
+            "tr([7d94197e/86'/1'/0']tpubDCyQVJj8KzjiQsFjmb3KwECVXPvMwvAxxZGCP9XmWSopmjW3bCV3wD7TgxrUhiGSueDS1MU5X1Vb1YjYcp8jitXc5fXfdC1z68hDDEyKRNr/0/*)",
+            "tr([7d94197e/86'/1'/0']tpubDCyQVJj8KzjiQsFjmb3KwECVXPvMwvAxxZGCP9XmWSopmjW3bCV3wD7TgxrUhiGSueDS1MU5X1Vb1YjYcp8jitXc5fXfdC1z68hDDEyKRNr/1/*)",
+        )
+        .network(Network::Signet)
+        .create_wallet_no_persist()
+        .unwrap();
+        let result = Builder::new(Network::Bitcoin).build_with_wallets(vec![
+            (&first, SyncConfig::sync_from_last_checkpoint().build()),
+            (&second, SyncConfig::sync_from_last_checkpoint().build()),
+        ]);
+        assert_eq!(
+            result
+                .err()
+                .expect("invalid wallet set must be rejected")
+                .to_string(),
+            "wallet network and node network do not match"
+        );
+    }
+
+    #[test]
+    fn multi_wallet_builder_rejects_duplicate_external_descriptors() {
+        let first = public_wallet(Network::Bitcoin);
+        let second = public_wallet(Network::Bitcoin);
+        let result = Builder::new(Network::Bitcoin).build_with_wallets(vec![
+            (&first, SyncConfig::sync_from_last_checkpoint().build()),
+            (&second, SyncConfig::sync_from_last_checkpoint().build()),
+        ]);
+        assert_eq!(
+            result
+                .err()
+                .expect("invalid wallet set must be rejected")
+                .to_string(),
+            "wallet external descriptors must be distinct"
+        );
     }
 }
