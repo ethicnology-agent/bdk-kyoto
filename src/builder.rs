@@ -56,7 +56,7 @@ use crate::{
     SyncPolicy, SyncPolicyType, UpdateSubscriber,
 };
 
-const IMPOSSIBLE_REORG_DEPTH: usize = 7;
+const IMPOSSIBLE_REORG_DEPTH: u32 = 7;
 
 /// Build a compact block filter client and node for a specified wallet
 pub trait BuilderExt {
@@ -69,8 +69,11 @@ pub trait BuilderExt {
 
     /// Attempt to build the node with scripts from multiple [`Wallet`]s and following a [`SyncConfig`].
     ///
-    /// Only [`SyncFromLastCheckpoint`] configs are permitted. New and recovering wallets
-    /// must be synced individually.
+    /// Only [`SyncFromLastCheckpoint`] configs are permitted. To recover from a birthday,
+    /// insert its block checkpoint into the wallet's local chain first and configure a
+    /// sufficient wallet lookahead (for example, 1000 scripts per keychain).
+    /// The node starts from the earliest wallet checkpoint, allowing up to seven blocks of
+    /// rollback where the wallet has retained checkpoints in that height range.
     fn build_with_wallets(
         self,
         wallets: Vec<(&Wallet, SyncConfig<SyncFromLastCheckpoint>)>,
@@ -196,13 +199,14 @@ fn new_wallet_anchor(network: Network) -> HashCheckpoint {
     }
 }
 
-/// Walk back 7 blocks in case the last sync was an orphan block.
+/// Walk back at most 7 block heights in case the last sync was an orphan block.
+/// Sparse chains must not jump from a birthday checkpoint all the way to genesis.
 fn walk_back_max_reorg(checkpoint: CheckPoint) -> HashCheckpoint {
+    let minimum_height = checkpoint.height().saturating_sub(IMPOSSIBLE_REORG_DEPTH);
     let mut ret_cp = HashCheckpoint::new(checkpoint.height(), checkpoint.hash());
-    let cp_iter = checkpoint.iter();
-    for (index, next) in cp_iter.enumerate() {
-        if index > IMPOSSIBLE_REORG_DEPTH {
-            return ret_cp;
+    for next in checkpoint.iter() {
+        if next.height() < minimum_height {
+            break;
         }
         ret_cp = HashCheckpoint::new(next.height(), next.hash());
     }
@@ -230,3 +234,36 @@ impl Display for BuilderError {
 }
 
 impl std::error::Error for BuilderError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bdk_wallet::bitcoin::{hashes::Hash, BlockHash};
+    use bdk_wallet::chain::BlockId;
+
+    fn checkpoints(heights: &[u32]) -> CheckPoint {
+        CheckPoint::from_block_ids(heights.iter().map(|height| BlockId {
+            height: *height,
+            hash: BlockHash::from_byte_array([(*height % 256) as u8; 32]),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn sparse_birthday_checkpoint_does_not_rewind_to_genesis() {
+        let cp = checkpoints(&[0, 970_580]);
+        assert_eq!(walk_back_max_reorg(cp).height, 970_580);
+    }
+
+    #[test]
+    fn reorg_walkback_is_bounded_by_block_height() {
+        let cp = checkpoints(&[0, 100, 194, 197, 198, 200]);
+        assert_eq!(walk_back_max_reorg(cp).height, 194);
+    }
+
+    #[test]
+    fn contiguous_checkpoints_keep_seven_block_reorg_margin() {
+        let heights = (0..=20).collect::<Vec<_>>();
+        assert_eq!(walk_back_max_reorg(checkpoints(&heights)).height, 13);
+    }
+}
