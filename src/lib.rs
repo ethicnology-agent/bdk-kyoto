@@ -318,13 +318,26 @@ impl<W: Wallets> UpdateSubscriber<W> {
         }
     }
 
+    fn queue_block(&mut self, _height: u32, hash: BlockHash) {
+        self.queued_blocks.push(hash);
+    }
+
     async fn sync(&mut self) -> Result<(), UpdateError> {
+        let requester = self.requester.clone();
+        self.sync_with_fetch(|hash| requester.get_block(hash)).await
+    }
+
+    async fn sync_with_fetch<F, Fut>(&mut self, mut fetch: F) -> Result<(), UpdateError>
+    where
+        F: FnMut(BlockHash) -> Fut,
+        Fut: core::future::Future<Output = Result<IndexedBlock, FetchBlockError>>,
+    {
         while let Some(message) = self.receiver.recv().await {
             match message {
                 Event::IndexedFilter(filter) => {
                     let block_hash = filter.block_hash();
                     if filter.contains_any(self.spk_cache.iter()) {
-                        self.queued_blocks.push(block_hash);
+                        self.queue_block(filter.height(), block_hash);
                     }
                 }
                 Event::ChainUpdate(changeset) => {
@@ -342,7 +355,7 @@ impl<W: Wallets> UpdateSubscriber<W> {
                     recent_history: _,
                 }) => {
                     while let Some(&hash) = self.queued_blocks.last() {
-                        let block = match self.requester.get_block(hash).await {
+                        let block = match fetch(hash).await {
                             Ok(block) => block,
                             // The block was reorganized out of the best chain after its filter
                             // matched, either before the node received the request or while it
@@ -674,3 +687,6 @@ impl SyncConfigBuilder<RecoverFromCheckpoint> {
         SyncConfig(self.policy, core::marker::PhantomData)
     }
 }
+
+#[cfg(test)]
+mod tests;
