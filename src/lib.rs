@@ -328,6 +328,16 @@ impl<W: Wallets> UpdateSubscriber<W> {
         self.queued_blocks.insert((height, hash));
     }
 
+    fn receive_filter(&mut self, height: u32, header: bip157::Header, filter: bip157::BlockFilter) {
+        let hash = header.block_hash();
+        if filter
+            .match_any(&hash, self.spk_cache.iter().map(|script| script.as_bytes()))
+            .expect("verified filter must decode")
+        {
+            self.queue_block(height, hash);
+        }
+    }
+
     async fn sync(&mut self) -> Result<(), UpdateError> {
         let requester = self.requester.clone();
         self.sync_with_fetch(|hash| requester.get_block(hash)).await
@@ -384,10 +394,9 @@ impl<W: Wallets> UpdateSubscriber<W> {
             };
             match message {
                 Event::IndexedFilter(filter) => {
-                    let block_hash = filter.block_hash();
-                    if filter.contains_any(self.spk_cache.iter()) {
-                        self.queue_block(filter.height(), block_hash);
-                    }
+                    let height = filter.height();
+                    let (header, filter) = filter.into_parts();
+                    self.receive_filter(height, header, filter);
                 }
                 Event::ChainUpdate(changeset) => {
                     if let Some(single) = self.single_update_builder.as_mut() {

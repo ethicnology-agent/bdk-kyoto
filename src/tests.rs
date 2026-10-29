@@ -540,3 +540,39 @@ async fn multi_cancelled_fetch_retains_each_wallet_update() {
         );
     }
 }
+
+// A checked historical range must be persistable even if the tip event never arrives.
+#[tokio::test]
+async fn cancellation_before_tip_yields_a_persistable_checkpoint() {
+    let wallet = wallet();
+    let (mut subscriber, sender, _node) = subscriber(&wallet, SyncPolicy::SyncFromLast, &[]);
+    // Remove the helper's tip boundary: recovery is still in progress.
+    subscriber.receiver.try_recv().unwrap();
+    let mut previous = wallet.latest_checkpoint().hash();
+    for height in 1..=1000 {
+        let mut header = bitcoin::blockdata::constants::genesis_block(Network::Bitcoin).header;
+        header.prev_blockhash = previous;
+        header.nonce = height;
+        previous = header.block_hash();
+        sender
+            .send(Event::ChainUpdate(BlockHeaderChanges::Connected(
+                bip157::chain::IndexedHeader { height, header },
+            )))
+            .unwrap();
+        subscriber.receive_filter(height, header, bip157::BlockFilter::new(&[0]));
+    }
+    let completed = tokio::time::timeout(
+        Duration::from_millis(100),
+        subscriber
+            .sync_with_fetch(|_| std::future::pending::<Result<IndexedBlock, FetchBlockError>>()),
+    )
+    .await;
+    assert!(
+        completed.is_ok(),
+        "cancelling recovery before the tip leaves no persistable update"
+    );
+    completed.unwrap().unwrap();
+    let update = subscriber.single_update_builder.as_mut().unwrap().finish();
+    assert_eq!(update.chain.as_ref().unwrap().height(), 1000);
+    assert_eq!(update.chain.unwrap().hash(), previous);
+}
