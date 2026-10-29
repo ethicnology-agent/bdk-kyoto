@@ -260,6 +260,15 @@ pub struct UpdateSubscriber<W: Wallets> {
     queued_blocks: BTreeSet<(u32, BlockHash)>,
     // Retain a consumed sync boundary when a block fetch is cancelled.
     filters_synced: bool,
+    // Verified headers are deliberately separate from the checkpoint delivered to wallets.
+    header_chain: BTreeMap<u32, CheckPoint>,
+    scanned_tip: BlockId,
+    last_boundary_height: u32,
+    pending_filters: BTreeMap<u32, (bip157::Header, bip157::BlockFilter)>,
+    pending_boundary: Option<ScanBoundary>,
+    tip_boundary: Option<BlockId>,
+    headers_only: bool,
+    awaiting_reorg: bool,
     // queued scripts to check filters
     spk_cache: HashSet<ScriptBuf>,
     // processes events for the wallet.
@@ -275,9 +284,29 @@ impl<W: Wallets> UpdateSubscriber<W> {
         policy: SyncPolicy,
         receiver: UnboundedReceiver<Event>,
         cp: CheckPoint,
+        scan_start: HashCheckpoint,
         graph: IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>,
     ) -> UpdateSubscriber<wallets::Single> {
+        let start = cp
+            .clone()
+            .insert(BlockId {
+                height: scan_start.height,
+                hash: scan_start.hash,
+            })
+            .get(scan_start.height)
+            .expect("inserted scan anchor");
+        let header_chain = start.iter().map(|cp| (cp.height(), cp)).collect();
         let mut update_builder = UpdateBuilder::new(cp, graph);
+        if matches!(
+            policy,
+            SyncPolicy::SyncFromLast
+                | SyncPolicy::Recovery {
+                    reuse_persisted_history: true,
+                    ..
+                }
+        ) {
+            update_builder.reuse_persisted_walkback(scan_start);
+        }
         update_builder.extend_index_for_recovery(policy);
         let spk_cache = update_builder.peek_scripts_from_policy(policy);
         UpdateSubscriber {
@@ -287,6 +316,17 @@ impl<W: Wallets> UpdateSubscriber<W> {
             multiple_updates_builder: None,
             queued_blocks: BTreeSet::new(),
             filters_synced: false,
+            header_chain,
+            scanned_tip: BlockId {
+                height: scan_start.height,
+                hash: scan_start.hash,
+            },
+            last_boundary_height: scan_start.height,
+            pending_filters: BTreeMap::new(),
+            pending_boundary: None,
+            tip_boundary: None,
+            headers_only: matches!(policy, SyncPolicy::NewWallet),
+            awaiting_reorg: false,
             spk_cache,
             _marker: core::marker::PhantomData,
         }
@@ -304,10 +344,37 @@ impl<W: Wallets> UpdateSubscriber<W> {
             ),
         >,
     ) -> UpdateSubscriber<wallets::Multiple> {
+        let wallets = wallet_iter.collect::<Vec<_>>();
+        let (scan_start, mut header_chain) = wallets
+            .iter()
+            .map(|wallet| {
+                (
+                    builder::walk_back_max_reorg(wallet.2.clone()),
+                    wallet.2.clone(),
+                )
+            })
+            .min_by_key(|(cp, _)| cp.height)
+            .expect("validated nonempty wallets");
+        for wallet in &wallets {
+            for cp in wallet
+                .2
+                .iter()
+                .filter(|cp| cp.height() <= scan_start.height)
+            {
+                header_chain = header_chain.insert(cp.block_id());
+            }
+        }
+        let header_chain = header_chain
+            .get(scan_start.height)
+            .expect("scan anchor belongs to its wallet")
+            .iter()
+            .map(|cp| (cp.height(), cp))
+            .collect();
         let mut update_map = BTreeMap::new();
         let mut spk_cache = HashSet::new();
-        for wallet in wallet_iter {
+        for wallet in wallets {
             let mut update_builder = UpdateBuilder::new(wallet.2, wallet.3);
+            update_builder.reuse_persisted_walkback(scan_start);
             update_builder.extend_index_for_recovery(wallet.1);
             spk_cache.extend(update_builder.peek_scripts_from_policy(wallet.1));
             update_map.insert(wallet.0, update_builder);
@@ -319,6 +386,17 @@ impl<W: Wallets> UpdateSubscriber<W> {
             multiple_updates_builder: Some(update_map),
             queued_blocks: BTreeSet::new(),
             filters_synced: false,
+            header_chain,
+            scanned_tip: BlockId {
+                height: scan_start.height,
+                hash: scan_start.hash,
+            },
+            last_boundary_height: scan_start.height,
+            pending_filters: BTreeMap::new(),
+            pending_boundary: None,
+            tip_boundary: None,
+            headers_only: false,
+            awaiting_reorg: false,
             spk_cache,
             _marker: core::marker::PhantomData,
         }
@@ -329,40 +407,174 @@ impl<W: Wallets> UpdateSubscriber<W> {
     }
 
     fn receive_filter(&mut self, height: u32, header: bip157::Header, filter: bip157::BlockFilter) {
-        let hash = header.block_hash();
-        if filter
-            .match_any(&hash, self.spk_cache.iter().map(|script| script.as_bytes()))
-            .expect("verified filter must decode")
+        if height > self.scanned_tip.height {
+            self.pending_filters.insert(height, (header, filter));
+        } else if self
+            .header_chain
+            .get(&height)
+            .is_some_and(|cp| cp.hash() == header.block_hash())
         {
-            self.queue_block(height, hash);
+            // Explicit rescans may revisit already checked heights with an extended script cache.
+            if filter
+                .match_any(
+                    &header.block_hash(),
+                    self.spk_cache.iter().map(|script| script.as_bytes()),
+                )
+                .expect("verified filter must decode")
+            {
+                self.queue_block(height, header.block_hash());
+            }
         }
     }
 
-    async fn sync(&mut self) -> Result<(), UpdateError> {
+    fn apply_chain_event(&mut self, changes: &BlockHeaderChanges) {
+        if let BlockHeaderChanges::Reorganized { accepted, .. } = changes {
+            if let Some(first) = accepted.iter().min_by_key(|header| header.height) {
+                let fork_height = first.height;
+                self.pending_filters
+                    .retain(|height, _| *height < fork_height);
+                self.queued_blocks
+                    .retain(|(height, _)| *height < fork_height);
+                if self.scanned_tip.height >= fork_height {
+                    // The preceding header is the common ancestor of both chains.
+                    self.scanned_tip = BlockId {
+                        height: fork_height.saturating_sub(1),
+                        hash: first.header.prev_blockhash,
+                    };
+                }
+                self.last_boundary_height = self.last_boundary_height.min(self.scanned_tip.height);
+                self.pending_boundary = None;
+                self.tip_boundary = None;
+                self.filters_synced = false;
+                self.awaiting_reorg = false;
+                if let Some(single) = self.single_update_builder.as_mut() {
+                    single.checkpoint_checked = false;
+                }
+                if let Some(multiple) = self.multiple_updates_builder.as_mut() {
+                    for builder in multiple.values_mut() {
+                        builder.checkpoint_checked = false;
+                    }
+                }
+            }
+        }
+        match changes {
+            BlockHeaderChanges::Connected(header) => {
+                self.insert_header(header.height, header.block_hash());
+            }
+            BlockHeaderChanges::Reorganized { accepted, .. } => {
+                let mut accepted = accepted.iter().collect::<Vec<_>>();
+                accepted.sort_by_key(|header| header.height);
+                for header in accepted {
+                    self.insert_header(header.height, header.block_hash());
+                }
+            }
+            BlockHeaderChanges::ForkAdded(_) => {}
+        }
+    }
+
+    fn insert_header(&mut self, height: u32, hash: BlockHash) {
+        if self
+            .header_chain
+            .get(&height)
+            .is_some_and(|cp| cp.hash() == hash)
+        {
+            return;
+        }
+        if self.header_chain.contains_key(&height) {
+            self.header_chain.split_off(&height);
+        }
+        let previous = self
+            .header_chain
+            .range(..height)
+            .next_back()
+            .expect("verified header follows the scan anchor")
+            .1;
+        let cp = previous.clone().insert(BlockId { height, hash });
+        self.header_chain.insert(height, cp);
+    }
+
+    fn check_contiguous_filters(&mut self) {
+        if self.awaiting_reorg {
+            return;
+        }
+        let next_boundary = (self.last_boundary_height / CHECKPOINT_INTERVAL)
+            .checked_add(1)
+            .and_then(|period| period.checked_mul(CHECKPOINT_INTERVAL))
+            .unwrap_or(u32::MAX);
+        while self.scanned_tip.height < next_boundary {
+            let Some(next_height) = self.scanned_tip.height.checked_add(1) else {
+                break;
+            };
+            let Some((header, filter)) = self.pending_filters.get(&next_height) else {
+                break;
+            };
+            let Some(verified) = self.header_chain.get(&next_height) else {
+                break;
+            };
+            if verified.hash() != header.block_hash() {
+                // A stale filter must not bridge a reorganization gap.
+                self.pending_filters.remove(&next_height);
+                break;
+            }
+            let hash = verified.hash();
+            let matched = filter
+                .match_any(&hash, self.spk_cache.iter().map(|script| script.as_bytes()))
+                .expect("verified filter must decode");
+            self.pending_filters.remove(&next_height);
+            if matched {
+                self.queue_block(next_height, hash);
+            }
+            self.scanned_tip = BlockId {
+                height: next_height,
+                hash,
+            };
+        }
+        if self.scanned_tip.height >= next_boundary
+            && self.scanned_tip.height > self.last_boundary_height
+        {
+            self.pending_boundary = Some(ScanBoundary {
+                scanned_tip: self.scanned_tip,
+                synced_to_tip: false,
+            });
+        }
+        if let Some(tip) = self.tip_boundary {
+            if self.headers_only
+                || (self.scanned_tip.height >= tip.height && self.scanned_tip.hash == tip.hash)
+            {
+                self.pending_boundary = Some(ScanBoundary {
+                    scanned_tip: tip,
+                    synced_to_tip: true,
+                });
+            }
+        }
+    }
+
+    async fn sync(&mut self) -> Result<ScanBoundary, UpdateError> {
         let requester = self.requester.clone();
         self.sync_with_fetch(|hash| requester.get_block(hash)).await
     }
 
-    async fn sync_with_fetch<F, Fut>(&mut self, mut fetch: F) -> Result<(), UpdateError>
+    async fn sync_with_fetch<F, Fut>(&mut self, mut fetch: F) -> Result<ScanBoundary, UpdateError>
     where
         F: FnMut(BlockHash) -> Fut,
         Fut: core::future::Future<Output = Result<IndexedBlock, FetchBlockError>>,
     {
         loop {
-            if self.filters_synced {
-                // Apply funding outputs before later spends, even if filters arrived out of
-                // order. A queued block is retained across cancellation until it is applied.
+            self.check_contiguous_filters();
+            if let Some(boundary) = self.pending_boundary {
+                // Apply funding outputs before later spends; retain every outstanding fetch
+                // and its boundary across cancellation.
+                let mut invalidated = false;
                 while let Some(&(_, hash)) = self.queued_blocks.first() {
                     let block = match fetch(hash).await {
                         Ok(block) => block,
-                        // Preserve #180: orphaned matches have replacement filters of their own.
                         Err(FetchBlockError::UnknownHash) => {
-                            self.queued_blocks.pop_first();
-                            continue;
+                            invalidated = true;
+                            break;
                         }
                         Err(FetchBlockError::RecvError) if self.requester.is_running() => {
-                            self.queued_blocks.pop_first();
-                            continue;
+                            invalidated = true;
+                            break;
                         }
                         Err(_) => return Err(UpdateError::NodeStopped),
                     };
@@ -376,18 +588,44 @@ impl<W: Wallets> UpdateSubscriber<W> {
                     }
                     self.queued_blocks.pop_first();
                 }
-                if let Some(single) = self.single_update_builder.as_mut() {
-                    self.spk_cache
-                        .extend(single.peek_script_to_keychain_lookahead());
-                }
-                if let Some(multiple) = self.multiple_updates_builder.as_mut() {
-                    for builder in multiple.values() {
+                if invalidated {
+                    // The canonical chain changed while fetching. Consume its queued chain
+                    // event and replacement filters before allowing a persistable boundary.
+                    self.pending_boundary = None;
+                    self.tip_boundary = None;
+                    self.filters_synced = false;
+                    self.awaiting_reorg = true;
+                } else {
+                    let cp = self
+                        .header_chain
+                        .get(&boundary.scanned_tip.height)
+                        .expect("boundary has a verified header");
+                    if let Some(single) = self.single_update_builder.as_mut() {
+                        // A wallet already ahead of the shared scan frontier retains its
+                        // previously persisted checkpoint until the scan catches up.
+                        single.advance_checkpoint(cp, &self.header_chain);
+                        single.extend_active_script_window();
                         self.spk_cache
-                            .extend(builder.peek_script_to_keychain_lookahead());
+                            .extend(single.peek_script_to_keychain_lookahead());
                     }
+                    if let Some(multiple) = self.multiple_updates_builder.as_mut() {
+                        for builder in multiple.values_mut() {
+                            builder.advance_checkpoint(cp, &self.header_chain);
+                            builder.extend_active_script_window();
+                            self.spk_cache
+                                .extend(builder.peek_script_to_keychain_lookahead());
+                        }
+                    }
+                    self.last_boundary_height = boundary.scanned_tip.height;
+                    self.scanned_tip = boundary.scanned_tip;
+                    self.pending_boundary = None;
+                    if boundary.synced_to_tip {
+                        self.filters_synced = false;
+                        self.tip_boundary = None;
+                        self.headers_only = false;
+                    }
+                    return Ok(boundary);
                 }
-                self.filters_synced = false;
-                return Ok(());
             }
             let Some(message) = self.receiver.recv().await else {
                 return Err(UpdateError::NodeStopped);
@@ -398,33 +636,85 @@ impl<W: Wallets> UpdateSubscriber<W> {
                     let (header, filter) = filter.into_parts();
                     self.receive_filter(height, header, filter);
                 }
-                Event::ChainUpdate(changeset) => {
-                    if let Some(single) = self.single_update_builder.as_mut() {
-                        single.apply_chain_event(&changeset);
-                    }
-                    if let Some(multiple) = self.multiple_updates_builder.as_mut() {
-                        for builder in multiple.values_mut() {
-                            builder.apply_chain_event(&changeset);
-                        }
-                    }
+                Event::ChainUpdate(changeset) => self.apply_chain_event(&changeset),
+                Event::FiltersSynced(update) => {
+                    self.filters_synced = true;
+                    self.tip_boundary = Some(BlockId {
+                        height: update.tip.height,
+                        hash: update.tip.hash,
+                    });
                 }
-                Event::FiltersSynced(_) => self.filters_synced = true,
             }
         }
     }
 }
 
+/// Height interval between persistable partial updates (at global multiples).
+/// A scan starting between multiples emits its first partial after fewer filters.
+/// Matched blocks are fetched before emitting the boundary, so download stalls may delay it.
+pub const CHECKPOINT_INTERVAL: u32 = 1_000;
+
+/// A persistable update boundary, shared by every configured wallet.
+#[derive(Debug, Clone)]
+pub struct UpdateBatch<T> {
+    /// Wallet updates for this boundary.
+    pub updates: T,
+    /// Last fully scanned block, using the verified header chain's hash.
+    /// A wallet previously persisted beyond this shared frontier retains its own higher
+    /// checkpoint until the scan catches up; newly downloaded checkpoints never exceed this tip.
+    pub scanned_tip: BlockId,
+    /// True only for the final boundary signaled by the node's tip sync event.
+    pub synced_to_tip: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScanBoundary {
+    scanned_tip: BlockId,
+    synced_to_tip: bool,
+}
+
 impl UpdateSubscriber<wallets::Single> {
+    /// Return the next persistable partial or tip update.
+    /// Partial boundaries occur every [`CHECKPOINT_INTERVAL`] contiguous filters, after all
+    /// matched blocks have been applied in chain order. Cancellation retains pending work.
+    pub async fn update_batch(&mut self) -> Result<UpdateBatch<Update>, UpdateError> {
+        let boundary = self.sync().await?;
+        Ok(UpdateBatch {
+            updates: self.single_update_builder.as_mut().unwrap().finish(),
+            scanned_tip: boundary.scanned_tip,
+            synced_to_tip: boundary.synced_to_tip,
+        })
+    }
+
     /// Return the most recent [`Update`] for a wallet once it has synced to the network's tip.
     /// This may take a significant portion of time during wallet recoveries or dormant wallets.
     /// Note that you may call this method in a loop as long as the node is running.
     pub async fn update(&mut self) -> Result<Update, UpdateError> {
-        self.sync().await?;
+        while !self.sync().await?.synced_to_tip {}
         Ok(self.single_update_builder.as_mut().unwrap().finish())
     }
 }
 
 impl UpdateSubscriber<wallets::Multiple> {
+    /// Return every wallet's next persistable update at the same partial or tip boundary.
+    pub async fn updates_batch(
+        &mut self,
+    ) -> Result<UpdateBatch<BTreeMap<DescriptorId, Update>>, UpdateError> {
+        let boundary = self.sync().await?;
+        let updates = self
+            .multiple_updates_builder
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .map(|(id, builder)| (*id, builder.finish()))
+            .collect();
+        Ok(UpdateBatch {
+            updates,
+            scanned_tip: boundary.scanned_tip,
+            synced_to_tip: boundary.synced_to_tip,
+        })
+    }
+
     /// Return a set of [`Update`] for the configured wallets when synced to the network's tip. The
     /// [`Update`] are grouped with the [`DescriptorId`] of the external descriptor for each
     /// wallet.
@@ -434,7 +724,7 @@ impl UpdateSubscriber<wallets::Multiple> {
     pub async fn updates(
         &mut self,
     ) -> Result<impl Iterator<Item = (DescriptorId, Update)>, UpdateError> {
-        self.sync().await?;
+        while !self.sync().await?.synced_to_tip {}
         let mut map = BTreeMap::new();
         for (id, builder) in self.multiple_updates_builder.as_mut().unwrap().iter_mut() {
             map.insert(*id, builder.finish());
@@ -449,6 +739,10 @@ struct UpdateBuilder {
     cp: CheckPoint,
     // Transaction graph, required to process incoming blocks.
     graph: IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>,
+    recovery_script_count: Option<u32>,
+    checkpoint_checked: bool,
+    checkpoint_conflict_height: Option<u32>,
+    persisted_walkback: Option<CheckPoint>,
 }
 
 impl UpdateBuilder {
@@ -456,35 +750,75 @@ impl UpdateBuilder {
         cp: CheckPoint,
         graph: IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>,
     ) -> Self {
-        Self { cp, graph }
+        Self {
+            cp,
+            graph,
+            recovery_script_count: None,
+            checkpoint_checked: false,
+            checkpoint_conflict_height: None,
+            persisted_walkback: None,
+        }
     }
 
-    fn apply_chain_event(&mut self, event: &BlockHeaderChanges) {
-        match event {
-            BlockHeaderChanges::Connected(at) => {
-                let block_id = BlockId {
-                    hash: at.block_hash(),
-                    height: at.height,
-                };
-                self.cp = self.cp.clone().insert(block_id);
-            }
-            BlockHeaderChanges::Reorganized {
-                accepted,
-                reorganized: _,
-            } => {
-                for header in accepted {
-                    let block_id = BlockId {
-                        hash: header.block_hash(),
-                        height: header.height,
-                    };
-                    self.cp = self.cp.clone().insert(block_id);
-                }
-            }
-            _ => (),
+    fn reuse_persisted_walkback(&mut self, start: HashCheckpoint) {
+        if start.height < self.cp.height() && builder::walk_back_max_reorg(self.cp.clone()) == start
+        {
+            self.persisted_walkback = Some(self.cp.clone());
+        }
+    }
+
+    fn advance_checkpoint(&mut self, cp: &CheckPoint, headers: &BTreeMap<u32, CheckPoint>) {
+        if self
+            .persisted_walkback
+            .as_ref()
+            .is_some_and(|saved| cp.height() >= saved.height())
+        {
+            self.persisted_walkback = None;
+        }
+        if cp.height() >= self.cp.height() {
+            self.cp = cp.clone();
+            self.checkpoint_checked = true;
+            self.checkpoint_conflict_height = None;
+            return;
+        }
+        if !self.checkpoint_checked {
+            // Header sync precedes filter sync. Check a pre-existing ahead wallet once,
+            // and again after a reorg, rather than walking its chain for every filter.
+            self.checkpoint_conflict_height = self
+                .cp
+                .iter()
+                .filter_map(|known| {
+                    headers
+                        .get(&known.height())
+                        .filter(|canonical| canonical.hash() != known.hash())
+                        .map(|_| known.height())
+                })
+                .min();
+            self.checkpoint_checked = true;
+        }
+        if self
+            .checkpoint_conflict_height
+            .is_some_and(|height| height <= cp.height())
+        {
+            // The safe prefix carries an explicit conflict, so BDK can invalidate every
+            // disconnected higher checkpoint, including a shorter higher-work chain.
+            self.cp = cp.clone();
+            self.checkpoint_conflict_height = None;
         }
     }
 
     fn apply_block_event(&mut self, block: &IndexedBlock) {
+        if self
+            .persisted_walkback
+            .as_ref()
+            .and_then(|saved| saved.get(block.height))
+            .is_some_and(|saved| saved.hash() == block.block.block_hash())
+        {
+            // Automatic rollback verifies the canonical identity of already persisted history.
+            // Do not retroactively reindex it with a newer script window. Explicit earlier
+            // recoveries and later rescans still reindex; replacement reorg hashes never skip.
+            return;
+        }
         let height = block.height;
         let block = &block.block;
         let _ = self.graph.apply_block_relevant(block, height);
@@ -501,7 +835,16 @@ impl UpdateBuilder {
         else {
             return;
         };
+        self.recovery_script_count = Some(to_index);
+        self.extend_active_script_window();
+    }
+
+    fn extend_active_script_window(&mut self) {
+        let Some(count) = self.recovery_script_count else {
+            return;
+        };
         let index = &mut self.graph.index;
+        let to_index = count.max(index.lookahead());
         for keychain in [KeychainKind::External, KeychainKind::Internal] {
             let last_revealed = index.last_revealed_index(keychain).unwrap_or(0);
             if let Some(target) = last_revealed.saturating_add(to_index).checked_sub(1) {
@@ -518,13 +861,17 @@ impl UpdateBuilder {
             }
             SyncPolicy::Recovery {
                 used_script_index, ..
-            } => self.peek_scripts(used_script_index),
+            } => self.peek_scripts(used_script_index.max(self.graph.index.lookahead())),
         }
     }
 
     #[inline]
     fn peek_script_to_keychain_lookahead(&self) -> HashSet<ScriptBuf> {
-        self.peek_scripts(self.graph.index.lookahead())
+        self.peek_scripts(
+            self.recovery_script_count
+                .unwrap_or(0)
+                .max(self.graph.index.lookahead()),
+        )
     }
 
     fn peek_scripts(&self, to_index: u32) -> HashSet<ScriptBuf> {
@@ -615,6 +962,7 @@ enum SyncPolicy {
     Recovery {
         used_script_index: u32,
         cp: HashCheckpoint,
+        reuse_persisted_history: bool,
     },
     SyncFromLast,
 }
@@ -676,6 +1024,7 @@ impl SyncConfig<SyncFromLastCheckpoint> {
             policy: SyncPolicy::Recovery {
                 used_script_index,
                 cp,
+                reuse_persisted_history: false,
             },
             _marker: core::marker::PhantomData,
         }
@@ -697,6 +1046,22 @@ impl SyncConfigBuilder<SyncFromLastCheckpoint> {
 }
 
 impl SyncConfigBuilder<RecoverFromCheckpoint> {
+    /// Reuse unchanged persisted history during the initial seven-height reorg walk-back.
+    ///
+    /// Use this only to resume the same recovery from the wallet's latest persisted
+    /// checkpoint with its original script count. The configured checkpoint must equal the
+    /// wallet's bounded reorg walk-back. Explicit recovery scans reindex history by default.
+    pub fn reuse_persisted_history(mut self) -> Self {
+        if let SyncPolicy::Recovery {
+            reuse_persisted_history,
+            ..
+        } = &mut self.policy
+        {
+            *reuse_persisted_history = true;
+        }
+        self
+    }
+
     /// Return the completed [`SyncConfig`].
     pub fn build(self) -> SyncConfig<RecoverFromCheckpoint> {
         SyncConfig(self.policy, core::marker::PhantomData)

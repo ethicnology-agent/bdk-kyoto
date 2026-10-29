@@ -39,7 +39,7 @@
 //! }
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 
 use bdk_wallet::{
@@ -91,20 +91,23 @@ impl BuilderExt for Builder {
         if self.network().ne(&network) {
             return Err(BuilderError::NetworkMismatch);
         }
-        match sync_config.0 {
+        let scan_start = match sync_config.0 {
             SyncPolicy::NewWallet => {
                 self = self
                     .chain_state(ChainState::Checkpoint(new_wallet_anchor(network)))
                     .headers_only_sync();
+                new_wallet_anchor(network)
             }
             SyncPolicy::SyncFromLast => {
                 let sync_start = walk_back_max_reorg(wallet.latest_checkpoint());
                 self = self.chain_state(ChainState::Checkpoint(sync_start));
+                sync_start
             }
             SyncPolicy::Recovery { cp, .. } => {
                 self = self.chain_state(ChainState::Checkpoint(cp));
+                cp
             }
-        }
+        };
         let (node, client) = self.build();
         let bip157::Client {
             requester,
@@ -118,6 +121,7 @@ impl BuilderExt for Builder {
             sync_config.0,
             event_rx,
             wallet.latest_checkpoint(),
+            scan_start,
             indexed_graph,
         );
         let client = LightClient::new(
@@ -161,6 +165,23 @@ impl BuilderExt for Builder {
             .map(|(wallet, _)| walk_back_max_reorg(wallet.latest_checkpoint()))
             .min()
             .ok_or(BuilderError::EmptyIterator)?;
+        // Histories at/below the trusted starting anchor cannot be reconciled by headers
+        // downloaded strictly after it. Conflicts above it are resolved by that download.
+        let mut known_checkpoints = BTreeMap::new();
+        for (wallet, _) in &wallets {
+            for cp in wallet
+                .latest_checkpoint()
+                .iter()
+                .filter(|cp| cp.height() <= cp_min.height)
+            {
+                if known_checkpoints
+                    .insert(cp.height(), cp.hash())
+                    .is_some_and(|hash| hash != cp.hash())
+                {
+                    return Err(BuilderError::ConflictingCheckpoints);
+                }
+            }
+        }
         self = self.chain_state(ChainState::Checkpoint(cp_min));
         let (node, client) = self.build();
         let bip157::Client {
@@ -214,7 +235,7 @@ fn new_wallet_anchor(network: Network) -> HashCheckpoint {
 
 /// Walk back at most 7 block heights in case the last sync was an orphan block.
 /// Sparse chains must not jump from a birthday checkpoint all the way to genesis.
-fn walk_back_max_reorg(checkpoint: CheckPoint) -> HashCheckpoint {
+pub(crate) fn walk_back_max_reorg(checkpoint: CheckPoint) -> HashCheckpoint {
     let minimum_height = checkpoint.height().saturating_sub(IMPOSSIBLE_REORG_DEPTH);
     let mut ret_cp = HashCheckpoint::new(checkpoint.height(), checkpoint.hash());
     for next in checkpoint.iter() {
@@ -235,6 +256,8 @@ pub enum BuilderError {
     EmptyIterator,
     /// More than one wallet has the same external descriptor identifier.
     DuplicateDescriptor,
+    /// Wallet histories disagree at or below the trusted node starting checkpoint.
+    ConflictingCheckpoints,
 }
 
 impl Display for BuilderError {
@@ -246,6 +269,9 @@ impl Display for BuilderError {
             BuilderError::EmptyIterator => write!(f, "empty wallet iterator."),
             BuilderError::DuplicateDescriptor => {
                 write!(f, "wallet external descriptors must be distinct")
+            }
+            BuilderError::ConflictingCheckpoints => {
+                write!(f, "wallet checkpoints conflict at or below the sync anchor")
             }
         }
     }
